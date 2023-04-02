@@ -1,0 +1,1489 @@
+#!/usr/bin/php
+<?php
+	/*! untisbot v1.1.0 | (c) 2023 DrMaxNix | www.drmaxnix.de */
+	define("CONFIG_PATH", "/etc/untisbot/untisbot.ini");
+	define("UNTISBOT_VERSION", "1.1.0");
+	
+	
+	
+	
+	
+	/////////////
+	// I N I T //
+	/////////////
+	
+	// EXIT IF NOT CALLED BY SYSTEMD //
+	if(getenv("SYSTEMD") !== "true"){
+		echo("[ERROR] Must be started by systemd" . "\n");
+		exit(1);
+	}
+	
+	
+	// EXIT IF NOT RUNNING AS ROOT USER //
+	if(!isset($_SERVER["USER"]) or $_SERVER["USER"] !== "untisbot"){
+		echo("[ERROR] Must run as user 'untisbot'" . "\n");
+		exit(1);
+	}
+	
+	
+	// LOAD PHPMAILER EXTENSION //
+	// check if installed
+	if(!is_file(__DIR__ . "/PHPMailer/src/Exception.php")){
+		echo("[ERROR] PHPMailer not installed" . "\n");
+		exit(1);
+	}
+	
+	// load
+	require(__DIR__ . "/PHPMailer/src/Exception.php");
+	require(__DIR__ . "/PHPMailer/src/PHPMailer.php");
+	require(__DIR__ . "/PHPMailer/src/SMTP.php");
+	
+	
+	// SET UP SIGNAL HANDLERS //
+	declare(ticks = 1);
+	pcntl_signal(SIGHUP, ["Daemon", "interrupt"]);
+	pcntl_signal(SIGTERM, ["Daemon", "interrupt"]);
+	pcntl_signal(SIGINT, ["Daemon", "interrupt"]);
+	
+	
+	// RUN INIT //
+	Daemon::init();
+	
+	
+	// PRINT INFO //
+	echo("[INFO ] untisbot v" . UNTISBOT_VERSION . " initialized successfully" . "\n");
+	
+	
+	// RUN MAIN //
+	Daemon::main();
+	
+	
+	
+	
+	
+	/////////////////////////////
+	// D A E M O N   C L A S S //
+	/////////////////////////////
+	
+	class Daemon {
+		/**
+		* @var bool $interrupt_allow		Whether interrupts are currently allowed.
+		*/
+		public static bool $interrupt_allow = false;
+		
+		
+		
+		/**
+		* @var array $interrupt_queue		List of pending interrupts to handle.
+		*/
+		public static array $interrupt_queue = [];
+		
+		
+		
+		/**
+		* CALLBACK: Do initialization.
+		*/
+		public static function init(): void {
+			// LOAD CONFIG //
+			Manager::config_load();
+		}
+		
+		
+		
+		/**
+		* CALLBACK: Run main code.
+		*/
+		public static function main(): void {
+			while(true){
+				// POSTPONE INTERRUPTS //
+				self::$interrupt_allow = false;
+				
+				
+				// ALIGN BOTS TO CONFIG //
+				Manager::align();
+				
+				
+				// BOT PARENTING //
+				Manager::parenting();
+				
+				
+				// CATCH UP ON MISSED INTERRUPTS //
+				self::interrupt_catchup();
+				
+				
+				// SLEEP //
+				usleep(1 * pow(10, 6));
+			}
+		}
+		
+		
+		
+		/**
+		* CALLBACK: Execute or enqueue interrupt.
+		* 
+		* @param int $signo			Signal number.
+		* @param mixed $siginfo		Additional signal info.
+		*/
+		public static function interrupt(int $signo, mixed $siginfo): void {
+			// CHECK IF INTERRUPTS ARE CURRENTLY ALLOWED //
+			if(self::$interrupt_allow){
+				// execute now
+				self::$interrupt_allow = false;
+				self::interrupt_callback($signo, $siginfo);
+				
+			} else {
+				// enqueue
+				self::$interrupt_queue[$signo] = ["siginfo" => $siginfo];
+			}
+		}
+		
+		
+		
+		/**
+		* HELPER: Execute enqueued interrupts and allow new interrupts.
+		*/
+		private static function interrupt_catchup(): void {
+			// EXECUTE ENQUEUED INTERRUPTS //
+			foreach(self::$interrupt_queue as $signo => $data){
+				// execute callback
+				self::interrupt_callback($signo, $data["siginfo"]);
+				
+				// remove self from queue
+				unset(self::$interrupt_queue[$signo]);
+			}
+			
+			
+			// ALLOW INTERRUPTS //
+			self::$interrupt_allow = true;
+		}
+		
+		
+		
+		/**
+		* CALLBACK: Decide which callback to execute for interrupt.
+		* 
+		* @param int $signo			Signal number.
+		* @param mixed $siginfo		Additional signal info.
+		*/
+		private static function interrupt_callback(int $signo, mixed $siginfo): void {
+			// hup
+			if($signo === SIGHUP){
+				self::sighup();
+			}
+			
+			// int / term
+			if(in_array($signo, [SIGINT, SIGTERM])){
+				self::sigterm();
+			}
+		}
+		
+		
+		
+		/**
+		* CALLBACK: Sighup received.
+		*/
+		private static function sighup(): void {
+			// RELOAD CONFIG //
+			Manager::config_load();
+			echo("[INFO ] sighub, config reloaded!" . "\n");
+		}
+		
+		
+		
+		/**
+		* CALLBACK: Sigterm received.
+		*/
+		private static function sigterm(): void {
+			// print info
+			echo("[INFO ] sigterm, coming to a halt" . "\n");
+			
+			// exit
+			exit(0);
+		}
+	}
+	
+	
+	
+	
+	
+	///////////////////////////////
+	// M A N A G E R   C L A S S //
+	///////////////////////////////
+	
+	class Manager {
+		/**
+		* @var ?array $config		Parsed configuration.
+		*/
+		private static ?array $config = null;
+		
+		
+		
+		/**
+		* @var array $bot		List of bot instance objects.
+		*/
+		private static array $bot = [];
+		
+		
+		
+		/**
+		* @var array $bot_data		List of config data for each individual bot.
+		*/
+		private static array $bot_data = [];
+		
+		
+		
+		/**
+		* @var array $bot_fetch_interval_config		List to keep track of changes in interval config.
+		*/
+		private static array $bot_fetch_interval_config = [];
+		
+		
+		
+		/**
+		* CALLBACK: (Re)load config.
+		*/
+		public static function config_load(): void {
+			// READ FILE CONTENTS //
+			// get
+			$ini = parse_ini_file(CONFIG_PATH, true, INI_SCANNER_TYPED);
+			
+			// check
+			if(!is_array($ini)){
+				// check if we can still run with old config
+				if(is_array(self::$config)){
+					echo("[WARN ] unable to reload config" . "\n");
+					return;
+					
+				} else {
+					echo("[ERROR] unable to load config" . "\n");
+					exit(1);
+				}
+			}
+			
+			
+			// CLEAR OLD CONFIG //
+			// account list
+			self::$config["account"] = [];
+			
+			
+			// PARSE //
+			self::config_parse($ini);
+		}
+		
+		
+		
+		/**
+		* Parse an ini config.
+		* 
+		* @param array $ini		Ini data obtained via `parse_ini_file()`.
+		*/
+		private static function config_parse(array $ini): void {
+			foreach($ini as $section_key => $section_value){
+				// check if this is a section (array without sequential numeric keys)
+				if(is_array($section_value) and array_keys($section_value) !== range(0, sizeof($section_value) - 1)){
+					// SECTION NAME IS BOT NAME //
+					$name = $section_key;
+					
+					
+					// SERVER HOST //
+					$host = $section_value["host"] ?? "";
+					if(!preg_match("/^(\w|-)+(\.(\w|-)+)+$/", $host)){
+						echo("[WARN ] ignoring account '" . $section_key . "': invalid host address '" . $host . "' in config" . "\n");
+						continue;
+					}
+					
+					
+					// SCHOOL NAME //
+					$school = $section_value["school"] ?? "";
+					if(!preg_match("/^(\w|-)+$/", $school)){
+						echo("[WARN ] ignoring account '" . $section_key . "': invalid school name '" . $school . "' in config" . "\n");
+						continue;
+					}
+					
+					
+					// AUTHENTICATION //
+					if(!isset($section_value["auth.username"])){
+						echo("[WARN ] ignoring account '" . $section_key . "': missing username in config" . "\n");
+						continue;
+					}
+					if(!isset($section_value["auth.password"])){
+						echo("[WARN ] ignoring account '" . $section_key . "': missing password in config" . "\n");
+						continue;
+					}
+					$auth_username = $section_value["auth.username"];
+					$auth_passwd = $section_value["auth.password"];
+					
+					
+					// NOTIFICATION PREFERENCES //
+					$notify = [];
+					
+					// messages
+					if(isset($section_value["notify.messages"])){
+						$mail = $section_value["notify.messages"];
+						if(preg_match("/^(\w|-)+(\.(\w|-)+)*@(\w|-)+(\.(\w|-)+)+$/", $mail)){
+							$notify["messages"] = $mail;
+						} else {
+							echo("[WARN ] ignoring notification preference 'messages' for account '" . $section_key . "': invalid mail address '" . $mail . "' in config" . "\n");
+						}
+					}
+					
+					
+					// ADD ACCOUNT //
+					self::$config["account"][$name] = [
+						"fetch" => [
+							"host" => $host,
+							"school" => $school,
+							"auth" => ["username" => $auth_username, "passwd" => $auth_passwd]
+						],
+						"notify" => $notify
+					];
+				}
+			}
+			
+			
+			// FETCH OPTIONS //
+			// timeout
+			self::$config["fetch"]["timeout"] = 20;
+			if(isset($ini["fetch.timeout"])){
+				if(is_int($ini["fetch.timeout"]) and $ini["fetch.timeout"] > 0){
+					self::$config["fetch"]["timeout"] = $ini["fetch.timeout"];
+				} else {
+					echo("[WARN ] ignoring fetch timeout: invalid value '" . $ini["fetch.timeout"] . "' in config" . "\n");
+				}
+			}
+			
+			// file download timeout
+			self::$config["fetch"]["file_download_timeout"] = 120;
+			if(isset($ini["fetch.file_download_timeout"])){
+				if(is_int($ini["fetch.file_download_timeout"]) and $ini["fetch.file_download_timeout"] > 0){
+					self::$config["fetch"]["file_download_timeout"] = $ini["fetch.file_download_timeout"];
+				} else {
+					echo("[WARN ] ignoring fetch file download timeout: invalid value '" . $ini["fetch.file_download_timeout"] . "' in config" . "\n");
+				}
+			}
+			
+			// messages
+			self::$config["fetch"]["interval"]["messages"] = 300;
+			if(isset($ini["fetch.interval.messages"])){
+				if(is_int($ini["fetch.interval.messages"]) and $ini["fetch.interval.messages"] > 0){
+					self::$config["fetch"]["interval"]["messages"] = $ini["fetch.interval.messages"];
+				} else {
+					echo("[WARN ] ignoring messages fetch interval: invalid value '" . $ini["fetch.interval.messages"] . "' in config" . "\n");
+				}
+			}
+			
+			
+			// OPTIONS FOR OUTGOING MAIL SERVER //
+			$had_error = false;
+			
+			// host
+			$host = $ini["mail.host"] ?? "";
+			if(!preg_match("/^(\w|-)+(\.(\w|-)+)+$/", $host)){
+				echo("[WARN ] ignoring mail settings: invalid host address '" . $host . "' in config" . "\n");
+				$had_error = true;
+			}
+			
+			// port
+			$port = $ini["mail.port"] ?? -1;
+			if(!is_int($port) or $port <= 0 or $port > 65535){
+				echo("[WARN ] ignoring mail settings: invalid port '" . $port . "' in config" . "\n");
+				$had_error = true;
+			}
+			
+			// username
+			if(!isset($ini["mail.username"])){
+				echo("[WARN ] ignoring mail settings: missing username in config" . "\n");
+				$had_error = true;
+			}
+			$username = $ini["mail.username"];
+			
+			// password
+			if(!isset($ini["mail.password"])){
+				echo("[WARN ] ignoring mail settings: missing password in config" . "\n");
+				$had_error = true;
+			}
+			$passwd = $ini["mail.password"];
+			
+			// starttls?
+			$starttls = $ini["mail.starttls"] ?? "";
+			if(!is_bool($starttls)){
+				echo("[WARN ] ignoring mail settings: invalid boolean value for starttls option '" . $ini["mail.starttls"] . "' in config" . "\n");
+				$had_error = true;
+			}
+			
+			// collect options
+			if(!$had_error){
+				// valid config
+				self::$config["mail"] = [
+					"host" => $host,
+					"port" => $port,
+					"username" => $username,
+					"passwd" => $passwd,
+					"starttls" => $starttls
+				];
+				
+			} else {
+				// invalid config
+				self::$config["mail"] = null;
+			}
+		}
+		
+		
+		
+		/**
+		* GETTER: Get config.
+		*/
+		public static function config(): array {
+			return self::$config;
+		}
+		
+		
+		
+		/**
+		* SCHEDULED: Create/remove bot instances to match config.
+		*/
+		public static function align(): void {
+			// REMOVE BOTS //
+			foreach(self::$bot as $name => $object){
+				// check if set in config
+				if(!isset(self::$config["account"][$name])){
+					// remove bot
+					unset(self::$bot[$name]);
+					unset(self::$bot_data[$name]);
+					unset(self::$bot_fetch_interval_config[$name]);
+					echo("[INFO ] removed bot " . $name . "\n");
+				}
+			}
+			
+			
+			foreach(self::$config["account"] as $name => $data){
+				// CREATE BOT //
+				// check if bot with this name exists
+				if(!isset(self::$bot[$name])){
+					// store account config and fetch interval data
+					self::$bot_data[$name] = $data;
+					self::$bot_fetch_interval_config[$name] = self::config()["fetch"]["interval"];
+					
+					// create bot
+					self::$bot[$name] = new Untisbot($name, self::$bot_data[$name]);
+					echo("[INFO ] created bot '" . $name . "'" . "\n");
+					continue;
+				}
+				
+				
+				// UPDATE BOT //
+				if(self::$bot_data[$name] !== $data or self::$bot_fetch_interval_config[$name] !== self::config()["fetch"]["interval"]){
+					// set new account config and fetch interval data
+					self::$bot_data[$name] = $data;
+					self::$bot_fetch_interval_config[$name] = self::config()["fetch"]["interval"];
+					
+					// create new bot
+					self::$bot[$name] = new Untisbot($name, self::$bot_data[$name]);
+					echo("[INFO ] updated bot '" . $name . "'" . "\n");
+				}
+			}
+		}
+		
+		
+		
+		/**
+		* SCHEDULED: Do parenting on all bots.
+		*/
+		public static function parenting(): void {
+			foreach(self::$bot as $name => $object){
+				$object->parenting();
+			}
+		}
+	}
+	
+	
+	
+	
+	
+	/////////////////////////////////
+	// U N T I S B O T   C L A S S //
+	/////////////////////////////////
+	
+	class Untisbot {
+		/**
+		* @var string $name		Bot name.
+		*/
+		private string $name;
+		
+		
+		
+		/**
+		* @var string $host		Remote Server host.
+		*/
+		private string $host;
+		
+		
+		
+		/**
+		* @var string $school		Account's school name.
+		*/
+		private string $school;
+		
+		
+		
+		/**
+		* @var array $auth		Auth to use for api requests.
+		*/
+		private array $auth;
+		
+		
+		
+		/**
+		* @var array $notify		Notification preferences.
+		*/
+		private array $notify;
+		
+		
+		
+		/**
+		* @var Timer $timer_fetch_messages		Timer object for periodic check for new messages.
+		*/
+		private Timer $timer_fetch_messages;
+		
+		
+		
+		/**
+		* CONSTRUCTOR: Create new bot.
+		* 
+		* @param string $name		Bot name.
+		* @param array $data		Bot configuration data.
+		* 
+		* @return Untisbot			New Untisbot object.
+		*/
+		public function __construct(string $name, array $data){
+			// SAVE NAME //
+			$this->name = $name;
+			
+			
+			// SAVE DATA //
+			// server host
+			$this->host = $data["fetch"]["host"];
+			
+			// school name
+			$this->school = $data["fetch"]["school"];
+			
+			// authentication
+			$this->auth = $data["fetch"]["auth"];
+			
+			// notification preferences
+			$this->notify = $data["notify"];
+			
+			
+			// SET UP FETCH TIMERS //
+			$this->timer_fetch_messages = new Timer(Manager::config()["fetch"]["interval"]["messages"]);
+		}
+		
+		
+		
+		/**
+		* SCHEDULED: Do parenting on our account.
+		*/
+		public function parenting(): void {
+			// CHECK TIMERS //
+			// fetch messages
+			if($this->timer_fetch_messages->check()){
+				$this->fetch_messages();
+			}
+		}
+		
+		
+		
+		/**
+		* SCHEDULED: Fetch new messages.
+		*/
+		private function fetch_messages(): void {
+			// IGNORE IF DISABLED FOR THIS ACCOUNT //
+			if(!isset($this->notify["messages"])) return;
+			
+			
+			// CREATE NEW API CONNECTION //
+			// get api object
+			$api = new Untisapi(
+				host: $this->host,
+				school: $this->school,
+				auth: $this->auth
+			);
+			
+			// initialize connection
+			if(!$api->init()){
+				echo("[WARN ] {" . $this->name . "} api init failed" . "\n");
+				return;
+			}
+			
+			
+			// LOAD MESSAGE LIST //
+			// get api data
+			$message_list = $api->message_list();
+			if($message_list === null){
+				echo("[WARN ] {" . $this->name . "} load message list failed" . "\n");
+				return;
+			}
+			
+			// merge normal and read-confirmation messages
+			$all_messages = array_merge($message_list["incomingMessages"], $message_list["readConfirmationMessages"]);
+			
+			
+			// GET NEW MESSAGES //
+			$new_message_list = [];
+			foreach($all_messages as $one_message){
+				// check if marked read
+				if(!$one_message["isMessageRead"]){
+					// handle unread message
+					echo("[INFO ] {" . $this->name . "} sending notification for message " . $one_message["id"] . "\n");
+					$this->message_unread_handle($api, $one_message["id"]);
+					echo("[INFO ] {" . $this->name . "} notification sent" . "\n");
+				}
+			}
+		}
+		
+		
+		
+		/**
+		* HELPER: Handle unread message.
+		* 
+		* @param Untisapi $api		Api instance to use.
+		* @param int $id			Id of message to handle.
+		*/
+		private function message_unread_handle(Untisapi $api, int $id): void {
+			// LOAD MESSAGE DETAILS //
+			$message = $api->message_details($id);
+			if($message === null){
+				echo("[WARN ] {" . $this->name . "} load message details failed" . "\n");
+				return;
+			}
+			
+			
+			// COLLECT IMPORTANT DATA //
+			// subject and content
+			$subject = $message["subject"];
+			$content = $message["content"];
+			
+			// sender
+			$sender = $message["sender"]["displayName"];
+			
+			// timestamp (when the message was sent)
+			$timestamp = strtotime($message["sentDateTime"]);
+			
+			// attachments
+			$attachment_list = $message["storageAttachments"];
+			
+			
+			// DOWNLOAD ATTACHMENTS //
+			foreach($attachment_list as $num => $one_attachment){
+				// store to tmp file
+				echo("[INFO ] {" . $this->name . "} downloading attachment " . $one_attachment["id"] . "\n");
+				$tmp_path = $api->attachment_download($one_attachment["id"]);
+				
+				// remember tmp path
+				$attachment_list[$num]["tmp_path"] = $tmp_path;
+			}
+			
+			
+			// CHECK IF READ RECEIPT IS REQUESTED //
+			$read_receipt_requested = isset($message["requestConfirmation"]);
+			
+			
+			// SEND MAIL //
+			// send
+			$success = $this->message_unread_send_mail([
+				"subject" => $subject,
+				"content" => $content,
+				"sender" => $sender,
+				"timestamp" => $timestamp,
+				"attachment_list" => $attachment_list,
+				"read_receipt_requested" => $read_receipt_requested
+			]);
+			
+			// check if successful
+			if(!$success){
+				echo("[WARN ] {" . $this->name . "} sending mail notification failed" . "\n");
+			}
+			
+			
+			// CLEAN UP TMP FILES //
+			foreach($attachment_list as $num => $one_attachment){
+				if($one_attachment["tmp_path"] === null) continue;
+				
+				// delete file
+				unlink($one_attachment["tmp_path"]);
+			}
+		}
+		
+		
+		
+		/**
+		* HELPER: Send a mail for an unread message.
+		* 
+		* @param array $data		Message data.
+		*/
+		private function message_unread_send_mail(array $data): bool {
+			// MAKE SURE MAIL IS CONFIGURED //
+			if(Manager::config()["mail"] === null){
+				echo("[WARN ] {" . $this->name . "} unable to send mail because it is not configured" . "\n");
+				return false;
+			}
+			
+			
+			// GET MAILER OBJECT //
+			$mailer = new Mailer($this->notify["messages"]);
+			
+			
+			// BUILD SUBJECT //
+			$subject = "[UntisBot] " . $data["sender"];
+			
+			
+			// BUILD BODY //
+			// start with subject
+			$body = "<b><u>" . $data["subject"] . "</u></b>" . "<br />";
+			$body .= "<br />";
+			
+			// add text content
+			$body .= $data["content"] . "<br />";
+			$body .= "<br />";
+			
+			// add footer
+			$body .= "<hr />";
+			
+			if($data["read_receipt_requested"]){
+				$body .= "<span style=\"color: orange;\">!! Read receipt requested !!</span>" . "<br />";
+				$body .= "<br />";
+			}
+			
+			if(sizeof($data["attachment_list"]) > 0){
+				$body .= "Attachments (" . sizeof($data["attachment_list"]) . "):" . "<br />";
+				$body .= "<ul>";
+				foreach($data["attachment_list"] as $one_attachment){
+					$body .= "<li>" . $one_attachment["name"] . ($one_attachment["tmp_path"] === null ? " <span style=\"color: red;\">[DOWNLOAD FAILED]</span>" : "") . "</li>" . "<br />";
+				}
+				$body .= "</ul>";
+			}
+			
+			$body .= "<span style=\"color: gray\">" . "Message sent to " . $this->name . " on " . date("D d-M-Y H:i:s T", $data["timestamp"]) . "</span>" . "<br />";
+			$body .= "<span style=\"color: gray\">" . "UntisBot v" . UNTISBOT_VERSION . "</span>";
+			
+			
+			// ADD SUBJECT AND BODY //
+			$mailer->content_set(subject: $subject, body: $body);
+			
+			
+			// ADD ATTACHMENTS //
+			foreach($data["attachment_list"] as $one_attachment){
+				// skip if not able to be downloaded or missing
+				if($one_attachment["tmp_path"] === null or !file_exists($one_attachment["tmp_path"])) continue;
+				
+				// attach file
+				$mailer->attachment_add(path: $one_attachment["tmp_path"], filename: $one_attachment["name"]);
+			}
+			
+			
+			// SEND MAIL //
+			return $mailer->send();
+		}
+	}
+	
+	
+	
+	
+	
+	/////////////////////////////////
+	// U N T I S A P I   C L A S S //
+	/////////////////////////////////
+	
+	class Untisapi {
+		/**
+		* @var string $host		Remote Server host.
+		*/
+		private string $host;
+		
+		
+		
+		/**
+		* @var string $school		Account's school name.
+		*/
+		private string $school;
+		
+		
+		
+		/**
+		* @var array $auth		Auth to use for api requests.
+		*/
+		private array $auth;
+		
+		
+		
+		/**
+		* @var CurlHandle $curl		Curl handle.
+		*/
+		private CurlHandle $curl;
+		
+		
+		
+		/**
+		* @var ?string $csrf		Csrf token for current session.
+		*/
+		private ?string $csrf;
+		
+		
+		
+		/**
+		* @var ?string $bearer		Bearer token for current session.
+		*/
+		private ?string $bearer;
+		
+		
+		
+		/**
+		* FLAG: Don't send a token.
+		*/
+		public const TOKEN_NONE = 0;
+		
+		
+		
+		/**
+		* FLAG: Use csrf token.
+		*/
+		public const TOKEN_CSRF = 1;
+		
+		
+		
+		/**
+		* FLAG: Use bearer token.
+		*/
+		public const TOKEN_BEARER = 2;
+		
+		
+		
+		/**
+		* CONSTRUCTOR: Create new api handle.
+		* 
+		* @param string $host		Remote Server host.
+		* @param string $school		Account's school name.
+		* @param array $auth		Auth to use for api requests.
+		* 
+		* @return Untisapi			New Untisapi object.
+		*/
+		public function __construct(string $host, string $school, array $auth){
+			// SAVE ACCOUNT DATA //
+			$this->host = $host;
+			$this->school = $school;
+			$this->auth = $auth;
+			
+			
+			// GET CURL OBJECT //
+			$this->curl = curl_init();
+		}
+		
+		
+		
+		/**
+		* Initialize connection with api.
+		* 
+		* @return bool		Whether initialization was successful.
+		*/
+		public function init(): bool {
+			// GET CSRF TOKEN //
+			$this->csrf = $this->csrf();
+			if($this->csrf === null){
+				echo("[WARN ] unable to initialize api connection (get csrf failed)" . "\n");
+				return false;
+			}
+			
+			
+			// DO LOGIN //
+			if(!$this->login()){
+				echo("[WARN ] unable to initialize api connection (login failed)" . "\n");
+				return false;
+			}
+			
+			
+			// GET BEARER TOKEN //
+			$this->bearer = $this->bearer();
+			if($this->bearer === null){
+				echo("[WARN ] unable to initialize api connection (get bearer failed)" . "\n");
+				return false;
+			}
+			
+			
+			// SUCCESS //
+			return true;
+		}
+		
+		
+		
+		/**
+		* HELPER: Get a csrf token.
+		* 
+		* @return ?string		`null`:		Failed to obtain token
+		* 						string:		Value of csrf token.
+		*/
+		private function csrf(): ?string {
+			// GET RAW HTML //
+			// do fetch
+			$html = $this->fetch("index.do?school=" . $this->school, token: self::TOKEN_NONE);
+			
+			// check if successful
+			if($html === null){
+				echo("[WARN ] unable to get csrf token (fetch failed)" . "\n");
+				return null;
+			}
+			
+			
+			// GET CONFIG //
+			// find in html
+			if(!preg_match("/(?<=config: ){[^\n]+}(?=,)/", $html, $match)){
+				echo("[WARN ] unable to get csrf token (didn't find config section in html)" . "\n");
+				return null;
+			}
+			
+			// decode json
+			$config = json_decode($match[0], true);
+			if(json_last_error() !== JSON_ERROR_NONE){
+				echo("[WARN ] unable to get csrf token (config section has invalid json)" . "\n");
+				return null;
+			}
+			
+			
+			// GET TOKEN //
+			// load from config
+			$csrf = $config["csrfToken"] ?? "";
+			
+			// validate format
+			if(!preg_match("/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/", $csrf)){
+				echo("[WARN ] unable to get csrf token (invalid format)" . "\n");
+				return null;
+			}
+			
+			
+			// RETURN CSRF TOKEN //
+			return $csrf;
+		}
+		
+		
+		
+		/**
+		* HELPER: Do login with given credentials.
+		* 
+		* @return bool		Whether login was successful.
+		*/
+		private function login(): bool {
+			// MAKE REQUEST //
+			// do fetch
+			$response = $this->fetch("j_spring_security_check",
+				post: [
+					"school" => $this->school,
+					"j_username" => $this->auth["username"],
+					"j_password" => $this->auth["passwd"]
+				],
+				header: [
+					"Accept" => "application/json"
+				],
+				token: self::TOKEN_CSRF
+			);
+			
+			// check if successful
+			if($response === null){
+				echo("[WARN ] unable to do login (fetch failed)" . "\n");
+				return false;
+			}
+			
+			
+			// CHECK IF SUCCESSFUL //
+			// decode response
+			$response = json_decode($response, true);
+			if(json_last_error() !== JSON_ERROR_NONE){
+				echo("[WARN ] unable to do login (invalid json response)" . "\n");
+				return false;
+			}
+			
+			// check state
+			if(!isset($response["state"])){
+				echo("[WARN ] unable to do login (response missing state attribute)" . "\n");
+				return false;
+			}
+			
+			// return state
+			return ($response["state"] === "SUCCESS");
+		}
+		
+		
+		
+		/**
+		* HELPER: Get a bearer authorization token.
+		* 
+		* @return ?string		`null`:		Failed to obtain token
+		* 						string:		Value of bearer token.
+		*/
+		private function bearer(): ?string {
+			// GET BEARER FROM API //
+			// fetch
+			$bearer = $this->fetch("api/token/new", token: self::TOKEN_CSRF);
+			
+			// check if successful
+			if($bearer === null){
+				echo("[WARN ] unable to get bearer token (fetch failed)" . "\n");
+				return null;
+			}
+			
+			// validate format
+			if(!preg_match("/^[\w\.-]{600,1000}$/", $bearer)){
+				echo("[WARN ] unable to get bearer token (invalid format)" . "\n");
+				return null;
+			}
+			
+			
+			// RETURN BEARER TOKEN //
+			return $bearer;
+		}
+		
+		
+		
+		/**
+		* Fetch list of messages.
+		* 
+		* @return ?array		`null`:		Failed to obtain list
+		* 						array:		List of all messages.
+		*/
+		public function message_list(): ?array {
+			// MAKE REQUEST //
+			// do fetch
+			$response = $this->fetch("api/rest/view/v1/messages");
+			
+			// check if successful
+			if($response === null){
+				echo("[WARN ] unable to load message list (fetch failed)" . "\n");
+				return null;
+			}
+			
+			
+			// DECODE RESPONSE //
+			$message_list = json_decode($response, true);
+			if(json_last_error() !== JSON_ERROR_NONE){
+				echo("[WARN ] unable to load message list (invalid json response)" . "\n");
+				return null;
+			}
+			
+			
+			// RETURN LIST //
+			return $message_list;
+		}
+		
+		
+		
+		/**
+		* Fetch message details.
+		* 
+		* @param int $id					Message id.
+		* @param bool $content_as_html		Whether message content should be formatted as html.
+		* 
+		* @return ?array		`null`:		Failed to obtain data
+		* 						array:		Message data.
+		*/
+		public function message_details(int $id, bool $content_as_html = true): ?array {
+			// MAKE REQUEST //
+			// do fetch
+			$response = $this->fetch("api/rest/view/v1/messages/" . $id . ($content_as_html ? "?contentAsHtml=true" : ""));
+			
+			// check if successful
+			if($response === null){
+				echo("[WARN ] unable to load message details (fetch failed)" . "\n");
+				return null;
+			}
+			
+			
+			// DECODE RESPONSE //
+			$message = json_decode($response, true);
+			if(json_last_error() !== JSON_ERROR_NONE){
+				echo("[WARN ] unable to load message details (invalid json response)" . "\n");
+				return null;
+			}
+			
+			
+			// RETURN DETAILS //
+			return $message;
+		}
+		
+		
+		
+		/**
+		* Download a message attachment.
+		* 
+		* @param string $id		Attachment id.
+		* 
+		* @return ?string		`null`:		Failed to download attachment
+		* 						string:		Temporary path of downloaded file on local machine.
+		*/
+		public function attachment_download(string $id): ?string {
+			// MAKE REQUEST //
+			// do fetch
+			$response = $this->fetch("api/rest/view/v1/messages/" . $id . "/attachmentstorageurl");
+			
+			// check if successful
+			if($response === null){
+				echo("[WARN ] unable to download attachment (fetch download url failed)" . "\n");
+				return null;
+			}
+			
+			
+			// DECODE RESPONSE //
+			// decode json
+			$response = json_decode($response, true);
+			if(json_last_error() !== JSON_ERROR_NONE){
+				echo("[WARN ] unable to download attachment (invalid json response for fetch download url)" . "\n");
+				return null;
+			}
+			
+			// get download url
+			$download_url = urldecode($response["downloadUrl"]);
+			
+			// get list of additional headers
+			$additional_header_list = [];
+			foreach($response["additionalHeaders"] as $one_additional_header){
+				if(strpos($one_additional_header["key"], "x-amz-") !== 0) continue;
+				$additional_header_list[$one_additional_header["key"]] = $one_additional_header["value"];
+			}
+			
+			// add date header
+			$additional_header_list["X-Amz-Date"] = gmdate("Ymd\THis\Z");
+			
+			
+			// DOWNLOAD FILE //
+			// get tmp path
+			$tmp_path = tempnam(sys_get_temp_dir(), "untisbot-attachment-");
+			
+			// do download
+			if($this->fetch($download_url, download_path: $tmp_path, header: $additional_header_list) === null){
+				echo("[WARN ] unable to download attachment (fetch download failed)" . "\n");
+				return null;
+			}
+			
+			
+			// MAKE SURE FILE EXISTS //
+			if(!file_exists($tmp_path) or filesize($tmp_path) <= 0){
+				echo("[WARN ] unable to download attachment (downloaded file not existing or empty)" . "\n");
+				return null;
+			}
+			
+			
+			// RETURN TMP PATH //
+			return $tmp_path;
+		}
+		
+		
+		
+		/**
+		* HELPER: Execute curl request.
+		* 
+		* @param string $location			Url or sub-path to fetch.
+		* 
+		* @param ?array $post				`null`:		GET request
+		*									array:		POST request with given data.
+		* 
+		* @param ?array $header				Optional list of headers to send.
+		* @param int $token					Bitmask of tokens to send.
+		* 
+		* @param ?string $download_path		`null`:		Return response as string
+		*									string:		Save response to local file at given path.
+		* 
+		* @return ?string					`null`:		Request failed
+		*									string:		Response content (request successful).
+		*/
+		private function fetch(string $location, ?array $post = null, ?array $header = null, int $token = self::TOKEN_BEARER, ?string $download_path = null): ?string {
+			// RESET CURL OPTIONS //
+			curl_reset($this->curl);
+			
+			
+			// SET URL //
+			if(strpos($location, "http") === 0){
+				// absolute path
+				curl_setopt($this->curl, CURLOPT_URL, $location);
+				
+			} else {
+				// relative path
+				curl_setopt($this->curl, CURLOPT_URL, "https://" . $this->host . "/WebUntis/" . $location);
+			}
+			
+			
+			// PREPARE RESPONSE RETURN OR DOWNLOAD //
+			if($download_path === null){
+				// return response
+				curl_setopt($this->curl, CURLOPT_RETURNTRANSFER, true);
+				curl_setopt($this->curl, CURLOPT_TIMEOUT, Manager::config()["fetch"]["timeout"]);
+				
+			} else {
+				// download response to file
+				$download_handle = fopen($download_path, "w+");
+				curl_setopt($this->curl, CURLOPT_FILE, $download_handle);
+				curl_setopt($this->curl, CURLOPT_TIMEOUT, Manager::config()["fetch"]["file_download_timeout"]);
+			}
+			
+			
+			// SET OTHER OPTIONS //
+			curl_setopt_array($this->curl, [
+				// default request method is get
+				CURLOPT_HTTPGET => true,
+				
+				// store cookies with curl object
+				CURLOPT_COOKIEFILE => "",
+				
+				// fake user agent for proprietary companies (to prevent them from banning curl requests)
+				CURLOPT_USERAGENT => "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:105.0) Gecko/20100101 Firefox/105.0"
+			]);
+			
+			
+			// BUILD REQUEST HEADERS //
+			$header_list = [];
+			
+			// maybe add csrf token
+			if($token === self::TOKEN_CSRF){
+				$header_list["X-CSRF-TOKEN"] = $this->csrf;
+			}
+			
+			// maybe add bearer token
+			if($token === self::TOKEN_BEARER){
+				$header_list["Authorization"] = "Bearer " . $this->bearer;
+			}
+			
+			// maybe add custom headers
+			if($header !== null){
+				$header_list = array_merge($header_list, $header);
+			}
+			
+			// flush headers
+			$header_list_string = [];
+			foreach($header_list as $key => $value){
+				$header_list_string[] = $key . ": " . $value;
+			}
+			curl_setopt($this->curl, CURLOPT_HTTPHEADER, $header_list_string);
+			
+			
+			// MAYBE ADD POST REQUEST BODY //
+			if($post !== null){
+				curl_setopt_array($this->curl, [
+					CURLOPT_POST => true,
+					CURLOPT_POSTFIELDS => http_build_query($post),
+				]);
+			}
+			
+			
+			// EXECUTE //
+			// send request
+			$exec = curl_exec($this->curl);
+			
+			// maybe close file handle
+			if(isset($download_handle) and is_resource($download_handle)){
+				fclose($download_handle);
+			}
+			
+			// check if request was successful
+			if($exec === false){
+				return null;
+			}
+			
+			// check http-status-code
+			if(curl_getinfo($this->curl, CURLINFO_HTTP_CODE) !== 200){
+				return null;
+			}
+			
+			// return
+			if($download_path === null){
+				// return source
+				return $exec;
+				
+			} else {
+				// download was successful
+				return "";
+			}
+		}
+	}
+	
+	
+	
+	
+	
+	/////////////////////////////
+	// M A I L E R   C L A S S //
+	/////////////////////////////
+	
+	class Mailer {
+		/**
+		* @var PHPMailer\PHPMailer\PHPMailer $phpmailer		PHPMailer object.
+		*/
+		private PHPMailer\PHPMailer\PHPMailer $phpmailer;
+		
+		
+		
+		/**
+		* CONSTRUCTOR: Create new mailer object.
+		* 
+		* @param string $to		Recipient mail address.
+		* 
+		* @return Mailer		New Mailer object.
+		*/
+		public function __construct(string $to){
+			// GET NEW PHPMAILER OBJECT //
+			$this->phpmailer = new PHPMailer\PHPMailer\PHPMailer();
+			
+			
+			// GENERAL SETTINGS //
+			// we use smtp to send our mail
+			$this->phpmailer->IsSMTP();
+			
+			// we use utf-8 encoding
+			$this->phpmailer->CharSet = "UTF-8";
+			
+			
+			// SMTP SETTINGS //
+			// host and smtp port
+			$this->phpmailer->Host = Manager::config()["mail"]["host"];
+			$this->phpmailer->Port = Manager::config()["mail"]["port"];
+			
+			// we need to authenticate
+			$this->phpmailer->SMTPAuth = true;
+			
+			// username and password
+			$this->phpmailer->Username = Manager::config()["mail"]["username"];
+			$this->phpmailer->Password = Manager::config()["mail"]["passwd"];
+			
+			// encryption
+			$this->phpmailer->SMTPSecure = (Manager::config()["mail"]["starttls"] ? PHPMailer\PHPMailer\PHPMailer::ENCRYPTION_STARTTLS : PHPMailer\PHPMailer\PHPMailer::ENCRYPTION_SMTPS);
+			
+			
+			// FROM AND TO //
+			// from
+			$this->phpmailer->setFrom(Manager::config()["mail"]["username"], "UntisBot");
+			
+			// recipient
+			$this->phpmailer->addAddress($to);
+			
+			
+			// META STUFF //
+			// replace x-mailer header
+			$this->phpmailer->XMailer = "untisbot (v" . UNTISBOT_VERSION . ")";
+		}
+		
+		
+		
+		/**
+		* Set mail content.
+		* 
+		* @param string $subject		Mail subject.
+		* @param string $body			Mail body.
+		*/
+		public function content_set(string $subject, string $body): void {
+			// CONTENT //
+			// this mail has html content
+			$this->phpmailer->isHTML(true);
+			
+			// set subject
+			$this->phpmailer->Subject = $subject;
+			
+			// html body
+			$this->phpmailer->Body = $body;
+		}
+		
+		
+		
+		/**
+		* Add an attachment to the mail.
+		* 
+		* @param string $path			Local path to the attachment file.
+		* @param string $filename		Filename to display in the mail.
+		* 
+		* @return bool					Whether attaching the file was successful.
+		*/
+		public function attachment_add(string $path, string $filename): bool {
+			return($this->phpmailer->addAttachment($path, $filename));
+		}
+		
+		
+		
+		/**
+		* Send the mail.
+		* 
+		* @return bool		Whether sending the mail was successful.
+		*/
+		public function send(): bool {
+			return($this->phpmailer->send());
+		}
+	}
+	
+	
+	
+	
+	
+	/////////////////////////////
+	// T I M E R   H E L P E R //
+	/////////////////////////////
+	
+	class Timer {
+		/**
+		* @var float $last		Unix timestamp of last time the timer fired.
+		*/
+		private float $last = 0;
+		
+		
+		
+		/**
+		* @var float $interval		Timer interval in seconds.
+		*/
+		private float $interval;
+		
+		
+		
+		/**
+		* Create new timer object.
+		* 
+		* @param float $interval		Timer interval in seconds.
+		* 
+		* @return Timer					New Timer object.
+		*/
+		public function __construct(float $interval){
+			$this->interval = $interval;
+		}
+		
+		
+		
+		/**
+		* Check if timer should fire.
+		* 
+		* @return bool					Whether timer should fire.
+		*/
+		public function check(): bool {
+			// GET TIME //
+			$time = microtime(true);
+			
+			
+			// CHECK IF TIMER SHOULD FIRE //
+			if($time - $this->last >= $this->interval){
+				// set new last-run-time
+				$this->last = $time;
+				
+				// timer should fire
+				return true;
+			}
+			
+			
+			// TIMER SHOULD NOT FIRE //
+			return false;
+		}
+		
+		
+		
+		/**
+		* Reset elapsed time to 0.
+		*/
+		public function restart(): void {
+			// FAKE LAST-RUN-TIME //
+			// get time
+			$time = microtime(true);
+			
+			// set
+			$this->last = $time;
+		}
+	}
+?>

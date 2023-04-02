@@ -1,0 +1,23 @@
+[Unit]
+Description=Improved mail notifications for Untis
+
+After=network-online.target
+Wants=network-online.target
+
+
+
+[Service]
+User=untisbot
+Group=untisbot
+
+Environment="SYSTEMD=true"
+ExecStart=/opt/untisbot/untisbotd
+
+ExecReload=/bin/kill -HUP $MAINPID
+
+Restart=on-failure
+
+
+
+[Install]
+WantedBy=multi-user.target
