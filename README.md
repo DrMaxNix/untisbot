@@ -4,7 +4,7 @@ Improved mail notifications for Untis
 
 
 ## Setup Instructions
-Install php 8.2:
+Install php (change `8.2` to latest version, anything `8.x` should work):
 ```console
 # apt install lsb-release ca-certificates apt-transport-https software-properties-common gnupg2
 # echo "deb https://packages.sury.org/php/ $(lsb_release -sc) main" | sudo tee /etc/apt/sources.list.d/sury-php.list
@@ -20,7 +20,7 @@ Clone git repository:
 # cd untisbot
 ```
 
-Install PHPMailer Library:
+Install PHPMailer Library (change `6.8.0` to latest version, anything `6.x.x` should work):
 ```console
 # git clone https://github.com/PHPMailer/PHPMailer --branch v6.8.0
 ```
