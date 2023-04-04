@@ -1,8 +1,9 @@
 #!/usr/bin/php
 <?php
-	/*! untisbot v1.1.0 | (c) 2023 DrMaxNix | www.drmaxnix.de */
+	/*! untisbot v1.1.1 | (c) 2023 DrMaxNix | www.drmaxnix.de */
+	declare(strict_types = 1);
 	define("CONFIG_PATH", "/etc/untisbot/untisbot.ini");
-	define("UNTISBOT_VERSION", "1.1.0");
+	define("UNTISBOT_VERSION", "1.1.1");
 	
 	
 	
